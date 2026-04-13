@@ -37,11 +37,80 @@ const server = http.createServer((req, res) => {
     return res.end('Missing x-target-host header');
   }
 
-  console.log(`Proxying: ${targetHost}${req.url}`);
+  console.log(`[Proxy] Relaying: ${targetHost}${req.url}`);
 
-  proxy.web(req, res, { 
-    target: `https://${targetHost}`,
-    changeOrigin: true
+  const curlArgs = [
+    '-X', req.method,
+    '-s', '-i', // Include headers in output
+    '-L',      // Follow redirects
+    '--max-time', '60',
+    `https://${targetHost}${req.url}`
+  ];
+
+  // Forward all allowed headers
+  const blockedHeaders = ['host', 'connection', 'content-length', 'x-proxy-auth', 'x-target-host'];
+  Object.keys(req.headers).forEach(h => {
+    if (!blockedHeaders.includes(h.toLowerCase())) {
+      curlArgs.push('-H', `${h}: ${req.headers[h]}`);
+    }
+  });
+
+  // Specifically set Host header to target
+  curlArgs.push('-H', `Host: ${targetHost}`);
+
+  // Handle body for POST/PUT
+  if (req.method === 'POST' || req.method === 'PUT') {
+    curlArgs.push('--data-binary', '@-');
+  }
+
+  const { spawn } = require('child_process');
+  const curl = spawn('curl', curlArgs);
+
+  // Pipe request body to curl if needed
+  if (req.method === 'POST' || req.method === 'PUT') {
+    req.pipe(curl.stdin);
+  }
+
+  // Parse curl output (headers + body)
+  let headerOutput = '';
+  let bodyStarted = false;
+
+  curl.stdout.on('data', (chunk) => {
+    if (bodyStarted) {
+      res.write(chunk);
+    } else {
+      headerOutput += chunk.toString();
+      const headerEndIndex = headerOutput.indexOf('\r\n\r\n');
+      if (headerEndIndex !== -1) {
+        bodyStarted = true;
+        const rawHeaders = headerOutput.substring(0, headerEndIndex).split('\r\n');
+        const bodyPart = headerOutput.substring(headerEndIndex + 4);
+        
+        // Finalize headers for res
+        const firstLine = rawHeaders[0]; // e.g., HTTP/1.1 200 OK
+        const statusCode = parseInt(firstLine.split(' ')[1]) || 200;
+        
+        const resHeaders = {};
+        for(let i=1; i<rawHeaders.length; i++) {
+          const [key, ...val] = rawHeaders[i].split(': ');
+          if (key && !['transfer-encoding', 'content-encoding', 'connection'].includes(key.toLowerCase())) {
+            resHeaders[key] = val.join(': ');
+          }
+        }
+        
+        res.writeHead(statusCode, resHeaders);
+        if (bodyPart.length > 0) {
+          res.write(Buffer.from(bodyPart));
+        }
+      }
+    }
+  });
+
+  curl.stdout.on('end', () => res.end());
+  curl.on('error', (err) => {
+    console.error('Proxy Bridge Error:', err);
+    res.writeHead(500);
+    res.end('Proxy Bridge Error');
   });
 });
 
